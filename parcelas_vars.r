@@ -51,22 +51,30 @@ gc()
 # Carga la capa espacial de permisos de construcción en formato GeoJSON
 permisos <- st_read("data_in/permisos_de_construccion_IM.geojson")
 
-### 3.1.2. Cruce a tabla maestra (Join) ----
-# Integramos atributos a la base 'padrones' eliminando la geometría para 
-# evitar redundancia espacial y optimizar la memoria. Se agregan sufijos '_per'
-# para prevenir futuros conflictos de nombres.
-padrones <- padrones %>%
-  left_join(
-    permisos %>% 
-      st_drop_geometry() %>% 
-      select(
-        padron, 
-        area_edif_per = area_edif, 
-        destino_per = dsc_destino, 
-        desc_tipo_obra_per = dsc_tipo_obra, 
-        fecha_aprob_per = fecha_aprob
-      ),
-    by = "padron"
+### 3.1.2. Preparación y Colapso de Permisos ----
+# Convertimos las múltiples obras de un padrón en un historial plano
+perm_colapsado <- permisos %>% 
+  st_drop_geometry() %>% 
+  select(padron, area_edif, dsc_destino, dsc_tipo_obra, fecha_aprob) %>%
+  arrange(padron, fecha_aprob) %>% # Ordenamos cronológicamente
+  group_by(padron) %>%
+  summarise(
+    # Contador de cuántos permisos ha solicitado el predio
+    n_permisos = n(), 
+    
+    # Colapsamos los datos con el separador " | "
+    across(
+      .cols = everything(), 
+      .fns = ~ paste(na.omit(.), collapse = " | ")
+    ),
+    .groups = "drop"
+  ) %>%
+  # Aplicamos nuestros sufijos estandarizados
+  rename(
+    area_edif_per = area_edif, 
+    destino_per = dsc_destino, 
+    desc_tipo_obra_per = dsc_tipo_obra, 
+    fecha_aprob_per = fecha_aprob
   )
 
 ### 3.1.3. Métricas de Calidad (Matches) ----
@@ -84,6 +92,13 @@ skim_perm <- permisos %>%
   mutate(base_origen = "permisos de edificación") %>% 
   relocate(base_origen, .before = skim_variable)
 
+
+### 3.1.5. Cruce a tabla maestra (Relación 1 a 1) ----
+padrones <- padrones %>%
+  left_join(
+    perm_colapsado,
+    by = "padron"
+  )
 
 ## 3.2. Protección Patrimonial -------------------------------------------------
 
@@ -118,7 +133,6 @@ padrones <- padrones %>%
   left_join(
     prot_all,
     by = "padron",
-    relationship = "many-to-many"
   )
 
 ### 3.2.4. Métricas de Calidad y Skim ----
@@ -246,22 +260,30 @@ skim_hab <- hab_all %>%
   mutate(base_origen = "habilitaciones comerciales") %>% 
   relocate(base_origen, .before = skim_variable)
 
-### 3.3.6. Cruce a tabla maestra (Join) ----
+### 3.3.6 Colapsar el historial de habilitaciones en strings cronológicos ----
+hab_colapsada <- hab_all %>%
+  arrange(padron, fecha) %>% # Ordenamos por fecha para que la secuencia tenga sentido
+  group_by(padron) %>%
+  summarise(
+    # Creamos un contador para saber cuántas habilitaciones históricas tuvo
+    n_habilitaciones = n(), 
+    
+    # Colapsamos las variables de interés separadas por " | "
+    across(
+      .cols = c(tipologia, tenencia_propiedad, fecha, area_a_habilitar, estado), 
+      .fns = ~ paste(na.omit(.), collapse = " | ")
+    ),
+    .groups = "drop"
+  ) %>%
+  # Agregamos el sufijo "_hab" a todas las columnas nuevas, protegiendo "padron"
+  rename_with(~ paste0(., "_hab"), -padron)
+
+### 3.3.7. Cruce a tabla maestra (Join) ----
 padrones <- padrones %>%
   left_join(
-    hab_all %>%
-      # Renombramos inyectando el sufijo _hab para proteger el diccionario
-      rename(
-        tipologia_hab = tipologia,
-        tenencia_propiedad_hab = tenencia_propiedad,
-        fecha_hab = fecha,
-        area_a_habilitar_hab = area_a_habilitar,
-        estado_hab = estado # <-- Añadido para estandarizar
-      ),
-    by = "padron",
-    relationship = "many-to-many"
+    hab_colapsada,
+    by = "padron"
   )
-
 
 ## 3.4. Transacciones DGR (2013-2026) ------------------------------------------
 
@@ -322,48 +344,72 @@ skim_trans <- trans_all %>%
   mutate(base_origen = "transacciones") %>% 
   relocate(base_origen, .before = skim_variable)
 
-### 3.4.5. Cruce a tabla maestra (Join) ----
-padrones <- padrones %>%
-  left_join(
-    trans_all,
-    by = "padron",
-    # Fundamental: un padrón puede registrar múltiples transacciones entre 2013-2026
-    relationship = "many-to-many" 
+### 3.4.5. Colapsar el historial de transacciones en strings ----
+trans_colapsado <- trans_all %>%
+  # Ordenar por fecha para que la secuencia tenga sentido cronológico
+  arrange(padron, fecha_trans) %>% 
+  group_by(padron) %>%
+  summarise(
+    # Creamos un contador muy útil para saber cuántas transacciones hubo
+    n_transacciones = n(), 
+    
+    # Colapsamos todas las demás variables separadas por " | "
+    across(
+      .cols = everything(), 
+      .fns = ~ paste(na.omit(.), collapse = " | ")
+    ),
+    .groups = "drop"
   )
 
+### 3.4.6. Cruce a tabla maestra (Join) ----
+padrones <- padrones %>%
+  left_join(
+    trans_colapsado,
+    by = "padron"
+    # Ya no necesitas relationship = "many-to-many" porque ahora es 1 a 1
+  )
 
 ## 3.5. Viviendas de Interés Social (VIS) --------------------------------------
 
 ### 3.5.1. Importación y Preparación ----
-# Leemos directamente desde la pestaña 'SUBPROYECTO' del archivo Excel.
-# Filtramos únicamente los proyectos de Montevideo para mantener la 
-# correspondencia geográfica con nuestra base de padrones.
 vis <- read_excel("data_in/vis/PROYECTOS_PROMOVIDOS_AL_20260831.xlsx", sheet = "SUBPROYECTO") %>%
   filter(DEPARTAMENTO == "MONTEVIDEO") %>%
   select(PADRON, PROMOVIDO, TIPO, TOTAL_VP) %>%
   rename_with(tolower) %>%             
-  mutate(padron = as.numeric(padron)) # Regla de oro: llave primaria como numérico
+  mutate(padron = as.numeric(padron))
 
-### 3.5.2. Métricas de Calidad y Skim ----
-# Evaluamos correspondencia directa (Matches) contra el universo base
+### 3.5.2. Colapso de Repeticiones (1 fila = 1 padrón) ----
+vis_colapsado <- vis %>%
+  group_by(padron) %>%
+  summarise(
+    # Llevamos la cuenta de cuántos proyectos VIS tiene el padrón
+    n_proyectos_vis = n(), 
+    
+    # Colapsamos las variables separadas por " | "
+    across(
+      .cols = c(promovido, tipo, total_vp), 
+      .fns = ~ paste(na.omit(.), collapse = " | ")
+    ),
+    .groups = "drop"
+  )
+
+### 3.5.3. Métricas de Calidad y Skim ----
+# Calculamos los matches sobre la base original para no distorsionar el QA
 vis_match <- sum(vis$padron %in% padrones_list)
 vis_unmatch <- sum(!vis$padron %in% padrones_list)
 
-# Resumen estadístico (Skim) de la data VIS
 skim_vis <- vis %>%
   skim() %>%
   mutate(capa_origen = "vis_subproyecto") %>%
   relocate(capa_origen, .before = skim_variable)
 
-### 3.5.3. Cruce a tabla maestra (Join) ----
-# Integramos a la tabla principal aplicando un sufijo preventivo (_vis) 
-# a todas las columnas excepto a la llave primaria 'padron'.
+### 3.5.4. Cruce a tabla maestra (Join 1 a 1) ----
 padrones <- padrones %>%
   left_join(
-    vis %>% 
+    vis_colapsado %>% 
       rename_with(~ paste0(., "_vis"), -padron), 
-    by = "padron",
-    relationship = "many-to-many"
+    by = "padron"
+    # Sin many-to-many: mantenemos la base plana
   )
 
 
@@ -372,7 +418,8 @@ padrones <- padrones %>%
 ## 4.1. Exportación de Base Maestra (.rds) -------------------------------------
 # Guardamos el objeto consolidado en formato nativo de R (.rds) para 
 # preservar los tipos de datos exactos (numeric, character) de cara al análisis.
-saveRDS(padrones, file = "data_out/padrones_consolidado_0910.rds")
+saveRDS(padrones, file = "data_out/padrones_consolidado_1910.rds")
+write.csv(padrones, file = "data_out/padrones_consolidado_1910.csv", row.names = FALSE)
 
 # (Opcional) Código para recargar la base maestra en futuras sesiones:
 # padrones <- readRDS("data_out/padrones_consolidado_0910.rds")
